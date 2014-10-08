@@ -15,3 +15,5 @@ clean:
 
 test: $(SOURCES)
 	$(CC) -o $@ $^ $(CFLAGS) $(LIBS)
+
+install:
