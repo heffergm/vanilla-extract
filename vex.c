@@ -1,9 +1,11 @@
 /* vex.c : vanilla-extract main */
 
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdbool.h>
@@ -37,8 +39,11 @@
 /* Assume one-fifth as many blocks as cells in the grid. Observed number is ~15000000 blocks. */
 #define MAX_WAY_BLOCKS (GRID_DIM * GRID_DIM / 5)
 
-/*
-  Define the sequence in which elements are read and written, while allowing element types as
+/* If true, then loaded file should not be persisted to disk. */
+static bool in_memory;
+
+/* 
+  Define the sequence in which elements are read and written, while allowing element types as 
   function parameters and array indexes.
 */
 #define NODE 0
@@ -46,7 +51,7 @@
 #define RELATION 2
 
 /* The location where we will save all files. This can be set using a command line parameter. */
-static char *database_path;
+static const char *database_path;
 
 /* Compact geographic position. Latitude and longitude mapped to the signed 32-bit int range. */
 typedef struct {
@@ -107,6 +112,10 @@ typedef struct {
     uint32_t cells[GRID_DIM][GRID_DIM]; // contains indexes to way_blocks
 } Grid;
 
+/* File descriptor for the lockfile. */
+/* Use BSD-style locks which are associated with the file, not the process. */
+static int lock_fd; 
+
 /* Print human readable representation based on multiples of 1024 into a static buffer. */
 static char human_buffer[128];
 char *human (size_t bytes) {
@@ -146,15 +155,19 @@ static char path_buf[512];
 static char *make_db_path (const char *name, uint32_t subfile) {
     if (strlen(name) >= sizeof(path_buf) - strlen(database_path) - 12)
         die ("Name too long.");
-    size_t path_length = strlen(database_path);
-    if (path_length == 0)
-        die ("Database path must be non-empty.");
-    if (database_path[path_length - 1] == '/')
-        path_length -= 1;
-    if (subfile == 0)
-        sprintf (path_buf, "%.*s/%s", (int)path_length, database_path, name);
-    else
-        sprintf (path_buf, "%.*s/%s.%03d", (int)path_length, database_path, name, subfile);
+    if (in_memory) {
+        sprintf (path_buf, "vex_%s.%d", name, subfile);
+    } else {
+        size_t path_length = strlen(database_path);
+        if (path_length == 0)
+            die ("Database path must be non-empty.");
+        if (database_path[path_length - 1] == '/')
+            path_length -= 1;
+        if (subfile == 0)
+            sprintf (path_buf, "%.*s/%s", (int)path_length, database_path, name);
+        else
+            sprintf (path_buf, "%.*s/%s.%03d", (int)path_length, database_path, name, subfile);
+    }
     return path_buf;
 }
 
@@ -179,24 +192,21 @@ static char *make_db_path (const char *name, uint32_t subfile) {
 */
 void *map_file(const char *name, uint32_t subfile, size_t size) {
     make_db_path (name, subfile);
-    printf("Mapping file '%s' of size %sB.\n", path_buf, human(size));
-    // including O_TRUNC causes much slower write (swaps pages in?)
-    int fd = open(path_buf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    int fd;
+    if (in_memory) {
+        printf("Opening shared memory object '%s' of size %sB.\n", path_buf, human(size));
+        fd = shm_open(path_buf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    } else {
+        printf("Mapping file '%s' of size %sB.\n", path_buf, human(size));
+        // including O_TRUNC causes much slower write (swaps pages in?)
+        fd = open(path_buf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    }
     void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED)
         die("Could not memory map file.");
     if (ftruncate (fd, size - 1)) // resize file
         die ("Error resizing file.");
     return base;
-}
-
-/* Open a buffered append FILE in the database directory, performing some checks. */
-FILE *open_db_file(const char *name, uint8_t subfile) {
-    make_db_path (name, subfile);
-    printf("Opening file '%s' as append stream.\n", path_buf);
-    FILE *file = fopen(path_buf, "a"); // Creates if file does not exist.
-    if (file == NULL) die("Could not open file for output.");
-    return file;
 }
 
 /* Open a buffered append FILE in the current working directory, performing some checks. */
@@ -263,14 +273,14 @@ static void set_grid_way_block (Node *node, uint32_t wbi) {
     *cell = wbi;
 }
 
-/* A file holding tags for a sub-range of the OSM ID space, with both stream and mmap access. */
+/* A memory block holding tags for a sub-range of the OSM ID space. */
 typedef struct {
-    FILE    *file;
     uint8_t *data;
+    size_t pos;
 } TagSubfile;
 
 #define MAX_SUBFILES 32
-static TagSubfile tag_subfiles[MAX_SUBFILES] = {[0 ... MAX_SUBFILES - 1] {NULL, NULL}};
+static TagSubfile tag_subfiles[MAX_SUBFILES] = {[0 ... MAX_SUBFILES - 1] {.data=NULL, .pos=0}};
 
 /*
   The ID space must be split up.
@@ -278,38 +288,46 @@ static TagSubfile tag_subfiles[MAX_SUBFILES] = {[0 ... MAX_SUBFILES - 1] {NULL, 
   relations than so we divide way IDs and multiply relation IDs to spread them evenly across
   the range of way IDs.
 */
-static uint32_t subfile_for_id(int64_t osmid, int entity_type) {
+static uint32_t subfile_index_for_id (int64_t osmid, int entity_type) {
     if (entity_type == NODE) osmid /= 16;
     else if (entity_type == RELATION) osmid *= 64;
     uint32_t subfile = osmid >> 25; // split the way id space into sub-ranges of 33 million IDs.
     return subfile;
 }
 
-static FILE *tag_file_for_id(int64_t osmid, int entity_type) {
-    uint32_t subfile = subfile_for_id (osmid, entity_type);
-    if (subfile >= MAX_SUBFILES) die ("Need more subfiles than expected.");
-    TagSubfile *ts = tag_subfiles + subfile;
-    if (ts->file == NULL) {
-        // Lazy-open a subfile for append when needed.
-        // Note that this will blow up if you do it after the file has been mapped
-        // because it will already be the max size and cannot be appended to.
-        ts->file = open_db_file("tags", subfile);
-        // All elements without tags will point to index 0, which contains the tag list terminator.
-        fputc(INT8_MAX, ts->file);
-    }
-    return ts->file;
-}
-
-/* TODO we really shouldn't allow mapping and append stream for the same file at once. */
-static uint8_t *tag_data_for_id(int64_t osmid, int entity_type) {
-    uint32_t subfile = subfile_for_id (osmid, entity_type);
+/* Get the subfile in which the tags for the given OSM entity should be stored. */
+static TagSubfile *tag_subfile_for_id (int64_t osmid, int entity_type) {
+    uint32_t subfile = subfile_index_for_id (osmid, entity_type);
     if (subfile >= MAX_SUBFILES) die ("Need more subfiles than expected.");
     TagSubfile *ts = &(tag_subfiles[subfile]);
     if (ts->data == NULL) {
         // Lazy-map a subfile when needed.
         ts->data = map_file("tags", subfile, UINT32_MAX); // all files are 4GB sparse maps
+        ts->pos = 0;
     }
-    return ts->data;
+    return ts;
+}
+
+/* 
+  Grab a pointer to tag subfile data directly. Convenience method to avoid manually dereferencing. 
+  This does not seek to the element within the tag file, it returns the beginning adress.
+  TODO perform the seek here as well?
+*/
+static uint8_t *tag_data_for_id (int64_t osmid, int entity_type) {
+    return tag_subfile_for_id(osmid, entity_type)->data;
+}
+
+/* Write a ProtobufCBinaryData out to a TagSubfile, updating the subfile position accordingly. */
+static void ts_write(ProtobufCBinaryData *bd, TagSubfile *ts) {
+    uint8_t *dst = ts->data + ts->pos;
+    uint8_t *src = bd->data;
+    for (int i = 0; i < bd->len; i++) *(dst++) = *(src++);
+    ts->pos += bd->len;
+}
+
+/* Write a ProtobufCBinaryData out to a TagSubfile, updating the subfile position accordingly. */
+static void ts_putc(char c, TagSubfile *ts) {
+    ts->data[(ts->pos)++] = c;
 }
 
 /*
@@ -317,10 +335,10 @@ static uint8_t *tag_data_for_id(int64_t osmid, int entity_type) {
   write compacted lists of key=value pairs to a file which do not require the string table.
   Returns the byte offset of the beginning of the new tag list within that file.
 */
-static uint32_t write_tags (uint32_t *keys, uint32_t *vals, int n, ProtobufCBinaryData *string_table, FILE *file) {
+static uint32_t write_tags (uint32_t *keys, uint32_t *vals, int n, ProtobufCBinaryData *string_table, TagSubfile *ts) {
     /* If there are no tags, point to index 0, which contains a single tag list terminator char. */
     if (n == 0) return 0;
-    uint64_t position = ftell(file);
+    uint64_t position = ts->pos;
     if (position > UINT32_MAX) die ("A tag file index has overflowed.");
     int n_tags_written = 0;
     for (int t = 0; t < n; t++) {
@@ -336,27 +354,27 @@ static uint32_t write_tags (uint32_t *keys, uint32_t *vals, int n, ProtobufCBina
         }
         int8_t code = encode_tag(key, val);
         // Code always written out to encode a key and/or a value, or indicate they are free text.
-        fputc(code, file);
+        ts_putc(code, ts);
         if (code == 0) {
             // Code 0 means zero-terminated key and value are written out in full.
             // Saving only tags with 'known' keys (nonzero codes) cuts file sizes in half.
             // Some are reduced by over 4x, which seem to contain a lot of bot tags.
             // continue;
-            fwrite(key.data, key.len, 1, file);
-            fputc(0, file);
-            fwrite(val.data, val.len, 1, file);
-            fputc(0, file);
+            ts_write(&key, ts);
+            ts_putc(0, ts);
+            ts_write(&val, ts);
+            ts_putc(0, ts);
         } else if (code < 0) {
             // Negative code provides key lookup, but value is written as zero-terminated free text.
-            fwrite(val.data, val.len, 1, file);
-            fputc(0, file);
+            ts_write(&val, ts);
+            ts_putc(0, ts);
         }
         n_tags_written++;
     }
     /* If all tags were skipped, return the index of the shared zero-length list. */
     if (n_tags_written == 0) return 0;
     /* The tag list is terminated with a single character. TODO maybe use 0 as terminator. */
-    fputc(INT8_MAX, file);
+    ts_putc(INT8_MAX, ts);
     return position;
 }
 
@@ -373,8 +391,8 @@ static void handle_node (OSMPBF__Node *node, ProtobufCBinaryData *string_table) 
     double lat = node->lat * 0.0000001;
     double lon = node->lon * 0.0000001;
     to_coord(&(nodes[node->id].coord), lat, lon);
-    FILE *tag_file = tag_file_for_id(node->id, NODE);
-    nodes[node->id].tags = write_tags (node->keys, node->vals, node->n_keys, string_table, tag_file);
+    TagSubfile *ts = tag_subfile_for_id(node->id, NODE);
+    nodes[node->id].tags = write_tags (node->keys, node->vals, node->n_keys, string_table, ts);
     nodes_loaded++;
     if (nodes_loaded % 1000000 == 0)
         printf("loaded %ldM nodes\n", nodes_loaded / 1000000);
@@ -426,8 +444,8 @@ static void handle_way (OSMPBF__Way *way, ProtobufCBinaryData *string_table) {
     if (nfree != -1) (wb->refs[WAY_BLOCK_SIZE - 1])++;
     ways_loaded++;
     /* Save tags to compacted tag array, and record the index where that tag list begins. */
-    FILE *tag_file = tag_file_for_id(way->id, WAY);
-    ways[way->id].tags = write_tags(way->keys, way->vals, way->n_keys, string_table, tag_file);
+    TagSubfile *ts = tag_subfile_for_id(way->id, WAY);
+    ways[way->id].tags = write_tags (way->keys, way->vals, way->n_keys, string_table, ts);
     if (ways_loaded % 1000000 == 0) {
         printf("loaded %ldM ways\n", ways_loaded / 1000000);
     }
@@ -501,7 +519,7 @@ int32_t last_x, last_y;
 int64_t last_node_id, last_way_id;
 
 static void save_init () {
-    ofile = open_db_file("out.bin", 0);
+    ofile = NULL; //open_db_file("out.bin", 0);
     last_x = 0;
     last_y = 0;
     last_node_id = 0;
@@ -552,6 +570,9 @@ int main (int argc, const char * argv[]) {
 
     if (argc != 3 && argc != 6) usage();
     database_path = argv[1];
+    in_memory = (strcmp(database_path, "memory") == 0);
+    lock_fd = open("/tmp/vex.lock", O_CREAT, S_IRWXU);
+    if (lock_fd == -1) die ("Error opening or creating lock file.");
 
     /* Memory-map files for each OSM element type, and for references between them. */
     grid       = map_file("grid",       0, sizeof(Grid));
@@ -566,8 +587,13 @@ int main (int argc, const char * argv[]) {
         osm_callbacks_t callbacks;
         callbacks.way = &handle_way;
         callbacks.node = &handle_node;
+        /* Request an exclusive write lock, blocking while reads complete. */
+        printf("Acquiring exclusive write lock on database.\n");
+        flock(lock_fd, LOCK_EX); 
         scan_pbf(filename, &callbacks); // we could just pass the callbacks by value
         fillFactor();
+        /* Release exclusive write lock, allowing reads to begin. */
+        flock(lock_fd, LOCK_UN);
         printf("loaded %ld nodes and %ld ways total.\n", nodes_loaded, ways_loaded);
         return EXIT_SUCCESS;
     } else if (argc == 6) {
@@ -591,6 +617,9 @@ int main (int argc, const char * argv[]) {
         uint32_t min_ybin = bin(cmin.y);
         uint32_t max_ybin = bin(cmax.y);
 
+        /* Request a shared read lock, blocking while any writes to complete. */
+        printf("Acquiring shared read lock on database.\n");
+        flock(lock_fd, LOCK_SH); 
         FILE *pbf_file = open_output_file("out.pbf", 0);
         write_pbf_begin(pbf_file);
 
@@ -638,6 +667,7 @@ int main (int argc, const char * argv[]) {
             write_pbf_flush();
         }
         fclose(pbf_file);
+        flock(lock_fd, LOCK_UN); // release the shared lock, allowing writes to begin.
     }
 
 }
