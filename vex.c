@@ -620,7 +620,7 @@ int main (int argc, const char * argv[]) {
         /* Request a shared read lock, blocking while any writes to complete. */
         printf("Acquiring shared read lock on database.\n");
         flock(lock_fd, LOCK_SH); 
-        FILE *pbf_file = open_output_file(argv[7], 0);
+        FILE *pbf_file = open_output_file(argv[6], 0);
         write_pbf_begin(pbf_file);
 
         /* Make two passes, first outputting all nodes, then all ways. */
