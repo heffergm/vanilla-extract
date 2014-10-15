@@ -568,7 +568,7 @@ static void save_way (int64_t way_id) {
 
 int main (int argc, const char * argv[]) {
 
-    if (argc != 3 && argc != 6) usage();
+    if (argc != 3 && argc != 7) usage();
     database_path = argv[1];
     in_memory = (strcmp(database_path, "memory") == 0);
     lock_fd = open("/tmp/vex.lock", O_CREAT, S_IRWXU);
@@ -596,7 +596,7 @@ int main (int argc, const char * argv[]) {
         flock(lock_fd, LOCK_UN);
         printf("loaded %ld nodes and %ld ways total.\n", nodes_loaded, ways_loaded);
         return EXIT_SUCCESS;
-    } else if (argc == 6) {
+    } else if (argc == 7) {
         /* QUERY */
         double min_lat = strtod(argv[2], NULL);
         double min_lon = strtod(argv[3], NULL);
@@ -620,7 +620,7 @@ int main (int argc, const char * argv[]) {
         /* Request a shared read lock, blocking while any writes to complete. */
         printf("Acquiring shared read lock on database.\n");
         flock(lock_fd, LOCK_SH); 
-        FILE *pbf_file = open_output_file("out.pbf", 0);
+        FILE *pbf_file = open_output_file(argv[7], 0);
         write_pbf_begin(pbf_file);
 
         /* Make two passes, first outputting all nodes, then all ways. */
