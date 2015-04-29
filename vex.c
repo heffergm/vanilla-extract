@@ -16,6 +16,7 @@
 #include "intpack.h"
 #include "pbf.h"
 #include "tags.h"
+#include "idtracker.h"
 
 // 14 bits -> 1.7km at 45 degrees
 // 13 bits -> 3.4km at 45 degrees
@@ -28,22 +29,26 @@
 /*
   https://taginfo.openstreetmap.org/reports/database_statistics
   There are over 10 times as many nodes as ways in OSM.
-  Assume there are as many active node references as there are active and deleted nodes.
 */
 #define MAX_NODE_ID   4000000000
 #define MAX_WAY_ID     400000000
-#define MAX_NODE_REFS 4000000000
+#define MAX_REL_MEMBERS 40000000
+#define MAX_REL_ID       4000000
+
+/* Assume there are as many active node references as there are active and deleted nodes. */
+#define MAX_NODE_REFS MAX_NODE_ID
 
 /* Way reference block size is based on the typical number of ways per grid cell. */
 #define WAY_BLOCK_SIZE 32
+
 /* Assume one-fifth as many blocks as cells in the grid. Observed number is ~15000000 blocks. */
 #define MAX_WAY_BLOCKS (GRID_DIM * GRID_DIM / 5)
 
 /* If true, then loaded file should not be persisted to disk. */
 static bool in_memory;
 
-/* 
-  Define the sequence in which elements are read and written, while allowing element types as 
+/*
+  Define the sequence in which elements are read and written, while allowing element types as
   function parameters and array indexes.
 */
 #define NODE 0
@@ -75,7 +80,11 @@ static double get_lon (coord_t *coord) {
     return ((double) coord->x) * 180 / INT32_MAX;
 }
 
-/* A block of way references. Chained together to record which ways begin in each grid cell. */
+/* 
+  A block of way references. Chained together to record which ways begin in each grid cell. 
+  Note that way references can still be stored in 32 bit integers since there are not as many of 
+  them as there are nodes.
+*/
 typedef struct {
     int32_t refs[WAY_BLOCK_SIZE];
     uint32_t next; // index of next way block, or number of free slots if negative
@@ -103,18 +112,37 @@ typedef struct {
 } Way;
 
 /*
+  A single OSM relation. Like nodes, relation IDs are assigned sequentially, so a zero-indexed array 
+  of these serves as a map from relation IDs to relations. OSM is just over 2^31 entities now, so
+  even if every node was in a relation we could still index them all relation members with a uint32.
+*/
+typedef struct {
+    uint32_t member_offset; // the index of the first member in this relation's member list
+    uint32_t tags; // byte offset into the packed tags array where this relation's tag list begins
+    uint32_t next; // the index of the next relation in this grid cell
+} Relation;
+
+/* Indexes for the first block of nodes and the first relation in each grid cell. */
+typedef struct {
+    uint32_t head_way_block;
+    uint32_t head_relation;
+} GridCell;
+
+/*
   The spatial index grid. A node's grid bin is determined by right-shifting its coordinates.
   Initially this was a multi-level grid, but it turns out to work fine as a single level.
   Rather than being directly composed of way reference blocks, there is a level of indirection
-  because the grid is mostly empty due to ocean and wilderness. TODO eliminate coastlines etc.
+  because the grid is mostly empty due to ocean and wilderness. 
+  TODO eliminate coastlines etc.
+  TODO struct is no longer necessary because this is not a compound type.
 */
 typedef struct {
-    uint32_t cells[GRID_DIM][GRID_DIM]; // contains indexes to way_blocks
+    GridCell cells[GRID_DIM][GRID_DIM]; // contains indexes to way_blocks and relations
 } Grid;
 
 /* File descriptor for the lockfile. */
 /* Use BSD-style locks which are associated with the file, not the process. */
-static int lock_fd; 
+static int lock_fd;
 
 /* Print human readable representation based on multiples of 1024 into a static buffer. */
 static char human_buffer[128];
@@ -146,7 +174,7 @@ char *human (size_t bytes) {
 }
 
 void die (char *s) {
-    printf("%s\n", s);
+    fprintf(stderr, "%s\n", s);
     exit(EXIT_FAILURE);
 }
 
@@ -194,10 +222,10 @@ void *map_file(const char *name, uint32_t subfile, size_t size) {
     make_db_path (name, subfile);
     int fd;
     if (in_memory) {
-        printf("Opening shared memory object '%s' of size %sB.\n", path_buf, human(size));
+        fprintf(stderr, "Opening shared memory object '%s' of size %sB.\n", path_buf, human(size));
         fd = shm_open(path_buf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     } else {
-        printf("Mapping file '%s' of size %sB.\n", path_buf, human(size));
+        fprintf(stderr, "Mapping file '%s' of size %sB.\n", path_buf, human(size));
         // including O_TRUNC causes much slower write (swaps pages in?)
         fd = open(path_buf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     }
@@ -211,20 +239,24 @@ void *map_file(const char *name, uint32_t subfile, size_t size) {
 
 /* Open a buffered append FILE in the current working directory, performing some checks. */
 FILE *open_output_file(const char *name, uint8_t subfile) {
-    printf("Opening file '%s' as append stream.\n", name);
+    fprintf(stderr, "Opening file '%s' as append stream.\n", name);
     FILE *file = fopen(name, "a"); // Creates if file does not exist.
     if (file == NULL) die("Could not open file for output.");
     return file;
 }
 
 /* Arrays of memory-mapped structs. This is where we store the bulk of our data. */
-Grid     *grid;
-Node     *nodes;
-Way      *ways;
-WayBlock *way_blocks;
-int64_t  *node_refs;  // A negative node_ref marks the end of a list of refs.
-uint32_t n_node_refs; // The number of node refs currently used.
+Grid      *grid;
+Node      *nodes;
+Way       *ways;
+WayBlock  *way_blocks;
+Relation  *relations;
+RelMember *rel_members;
+int64_t   *node_refs;        // A negative node_ref marks the end of a list of refs.
+uint32_t  n_rel_members = 1; // The number of relation members currently used. start at 1 since zero marks the end of lists.
+uint32_t  n_node_refs = 0;   // The number of node refs currently used.
 // FIXME n_node_refs will eventually overflow. The fact that it's unsigned gives us a little slack.
+// FIXME the n_vars were not initialized before?
 
 /*
   The number of way reference blocks currently allocated.
@@ -234,12 +266,12 @@ uint32_t n_node_refs; // The number of node refs currently used.
 uint32_t way_block_count = 1;
 static uint32_t new_way_block() {
     if (way_block_count % 100000 == 0)
-        printf("%dk way blocks in use out of %dk.\n", way_block_count/1000, MAX_WAY_BLOCKS/1000);
+        fprintf(stderr, "%dk way blocks in use out of %dk.\n", way_block_count/1000, MAX_WAY_BLOCKS/1000);
     if (way_block_count >= MAX_WAY_BLOCKS)
         die("More way reference blocks are used than expected.");
     // A negative value in the last ref entry gives the number of free slots in this block.
     way_blocks[way_block_count].refs[WAY_BLOCK_SIZE-1] = -WAY_BLOCK_SIZE;
-    // printf("created way block %d\n", way_block_count);
+    // fprintf(stderr, "created way block %d\n", way_block_count);
     return way_block_count++;
 }
 
@@ -249,8 +281,25 @@ static uint32_t bin (int32_t xy) {
 }
 
 /* Get the address of the grid cell for the given internal coord. */
-static uint32_t *get_grid_cell(coord_t coord) {
+static GridCell *get_grid_cell_for_coord (coord_t coord) {
     return &(grid->cells[bin(coord.x)][bin(coord.y)]);
+}
+
+/* Return the GridCell containing the first member of the given relation. */
+static GridCell *get_grid_cell_for_relation (Relation *r) {
+    RelMember first_member = rel_members[r->member_offset];
+    if (first_member.element_type == NODE) {
+        return get_grid_cell_for_coord (nodes[first_member.id].coord);
+    } else if (first_member.element_type == WAY) {
+        Way way = ways[first_member.id];
+        Node first_node = nodes[way.node_ref_offset];
+        return get_grid_cell_for_coord (first_node.coord);
+    } else { 
+        // (first_member.element_type == RELATION) {
+        // TODO recurse... but the referenced relation may not be loaded.
+        // so return null and catch this condition in the caller.
+        return NULL;
+    }
 }
 
 /*
@@ -258,19 +307,17 @@ static uint32_t *get_grid_cell(coord_t coord) {
   cell, creating a new way reference block if the grid cell is currently empty.
 */
 static uint32_t get_grid_way_block (Node *node) {
-    uint32_t *cell = get_grid_cell(node->coord);
-    if (*cell == 0) {
-        *cell = new_way_block();
+    GridCell *cell = get_grid_cell_for_coord (node->coord);
+    if (cell->head_way_block == 0) {
+        cell->head_way_block = new_way_block();
     }
-    // printf("xbin=%d ybin=%d\n", xb, yb);
-    // printf("index=%d\n", index);
-    return *cell;
+    return cell->head_way_block;
 }
 
-/* TODO make this insert a new block instead of just setting the grid cell contents. */
-static void set_grid_way_block (Node *node, uint32_t wbi) {
-    uint32_t *cell = get_grid_cell(node->coord);
-    *cell = wbi;
+/* TODO make this insert a new block at the list head instead of just setting the grid cell contents. */
+static void set_grid_way_block (Node *node, uint32_t way_block_index) {
+    GridCell *cell = get_grid_cell_for_coord (node->coord);
+    cell->head_way_block = way_block_index;
 }
 
 /* A memory block holding tags for a sub-range of the OSM ID space. */
@@ -285,7 +332,7 @@ static TagSubfile tag_subfiles[MAX_SUBFILES] = {[0 ... MAX_SUBFILES - 1] {.data=
 /*
   The ID space must be split up.
   Most tags are on ways. There are about 10 times as many nodes as ways, and 100 times less
-  relations than so we divide way IDs and multiply relation IDs to spread them evenly across
+  relations than [ways?] so we divide way IDs and multiply relation IDs to spread them evenly across
   the range of way IDs.
 */
 static uint32_t subfile_index_for_id (int64_t osmid, int entity_type) {
@@ -301,15 +348,20 @@ static TagSubfile *tag_subfile_for_id (int64_t osmid, int entity_type) {
     if (subfile >= MAX_SUBFILES) die ("Need more subfiles than expected.");
     TagSubfile *ts = &(tag_subfiles[subfile]);
     if (ts->data == NULL) {
-        // Lazy-map a subfile when needed.
+        /* Lazy-map a subfile the first time it is needed. */
         ts->data = map_file("tags", subfile, UINT32_MAX); // all files are 4GB sparse maps
-        ts->pos = 0;
+        /* 
+          Store a tag list terminator byte at the beginning of each file. This empty list will 
+          be shared by all entities that do not have any tags, which all have tag offset zero.
+        */
+        ts->data[0] = INT8_MAX; 
+        ts->pos = 1;
     }
     return ts;
 }
 
-/* 
-  Grab a pointer to tag subfile data directly. Convenience method to avoid manually dereferencing. 
+/*
+  Grab a pointer to tag subfile data directly. Convenience method to avoid manually dereferencing.
   This does not seek to the element within the tag file, it returns the beginning adress.
   TODO perform the seek here as well?
 */
@@ -325,7 +377,7 @@ static void ts_write(ProtobufCBinaryData *bd, TagSubfile *ts) {
     ts->pos += bd->len;
 }
 
-/* Write a ProtobufCBinaryData out to a TagSubfile, updating the subfile position accordingly. */
+/* Write a single char out to a TagSubfile, updating the subfile position accordingly. */
 static void ts_putc(char c, TagSubfile *ts) {
     ts->data[(ts->pos)++] = c;
 }
@@ -381,6 +433,7 @@ static uint32_t write_tags (uint32_t *keys, uint32_t *vals, int n, ProtobufCBina
 /* Count the number of nodes and ways loaded, just for progress reporting. */
 static long nodes_loaded = 0;
 static long ways_loaded = 0;
+static long rels_loaded = 0;
 
 /* Node callback handed to the general-purpose PBF loading code. */
 static void handle_node (OSMPBF__Node *node, ProtobufCBinaryData *string_table) {
@@ -388,14 +441,15 @@ static void handle_node (OSMPBF__Node *node, ProtobufCBinaryData *string_table) 
         die("OSM data contains nodes with larger IDs than expected.");
     if (ways_loaded > 0)
         die("All nodes must appear before any ways in input file.");
-    double lat = node->lat * 0.0000001;
-    double lon = node->lon * 0.0000001;
+    // lat and lon are in nanodegrees
+    double lat = node->lat * 0.000000001;
+    double lon = node->lon * 0.000000001;
     to_coord(&(nodes[node->id].coord), lat, lon);
     TagSubfile *ts = tag_subfile_for_id(node->id, NODE);
     nodes[node->id].tags = write_tags (node->keys, node->vals, node->n_keys, string_table, ts);
     nodes_loaded++;
     if (nodes_loaded % 1000000 == 0)
-        printf("loaded %ldM nodes\n", nodes_loaded / 1000000);
+        fprintf(stderr, "loaded %ldM nodes\n", nodes_loaded / 1000000);
     //printf ("---\nlon=%.5f lat=%.5f\nx=%d y=%d\n", lon, lat, nodes[node->id].x, nodes[node->id].y);
 }
 
@@ -414,8 +468,8 @@ static void handle_way (OSMPBF__Way *way, ProtobufCBinaryData *string_table) {
        ID is used to signal the end of the list.
     */
     ways[way->id].node_ref_offset = n_node_refs;
-    //printf("WAY %ld\n", way->id);
-    //printf("node ref offset %d\n", ways[way->id].node_ref_offset);
+    //fprintf(stderr, "WAY %ld\n", way->id);
+    //fprintf(stderr, "node ref offset %d\n", ways[way->id].node_ref_offset);
     int64_t node_id = 0;
     for (int r = 0; r < way->n_refs; r++, n_node_refs++) {
         node_id += way->refs[r]; // node refs are delta coded
@@ -447,122 +501,234 @@ static void handle_way (OSMPBF__Way *way, ProtobufCBinaryData *string_table) {
     TagSubfile *ts = tag_subfile_for_id(way->id, WAY);
     ways[way->id].tags = write_tags (way->keys, way->vals, way->n_keys, string_table, ts);
     if (ways_loaded % 1000000 == 0) {
-        printf("loaded %ldM ways\n", ways_loaded / 1000000);
+        fprintf(stderr, "loaded %ldM ways\n", ways_loaded / 1000000);
     }
 }
 
 /*
+  Relation callback handed to the general-purpose PBF loading code.
+  All nodes and ways must come before relations in the input file for this to work.
+  Copies one OSMPBF__Relation into a VEx Relation and inserts it in the grid spatial index.
+*/
+static void handle_relation (OSMPBF__Relation* relation, ProtobufCBinaryData *string_table) {
+    if (relation->n_memids == 0) return; // logic below expects at least one member reference
+    Relation *r = &(relations[relation->id]); // the Vex struct into which we are copying the PBF relation
+    r->member_offset = n_rel_members;
+    RelMember *rm = &(rel_members[n_rel_members]);
+    /* Check to avoid writing past the end of the relation members file. */
+    if (n_rel_members + relation->n_memids >= MAX_REL_MEMBERS) {
+        die ("relation members index is about to exceed its maximum allowed value.");
+    }
+    /* Copy all the relation members from PBF into the VEx array. */
+    int64_t last_id = 0;
+    for (int m = 0; m < relation->n_memids; m++, n_rel_members++, rm++) {
+        rm->role = encode_role(string_table[relation->roles_sid[m]]);
+        /* OSMPBF NODE, WAY, RELATION constants use the same ints as ours. */
+        rm->element_type = relation->types[m];
+        int64_t id = relation->memids[m] + last_id; // delta-decode
+        last_id = id;
+        rm->id = (uint32_t)id; // currently, 2^31 < max osmid < 2^32
+    }
+    (rm - 1)->id *= -1; // Negate the last relation member id to signal the end of the list
+    /* Save tags to compacted tag array, and record the index where this relation's tag list begins. */
+    TagSubfile *ts = tag_subfile_for_id (relation->id, RELATION);
+    r->tags = write_tags (relation->keys, relation->vals, relation->n_keys, string_table, ts);
+    /* Insert this relation at the head of a linked list in its containing spatial index grid cell.
+       The GridCell's head field is initially set to zero since it is in a new mmapped file. */
+    GridCell *grid_cell = get_grid_cell_for_relation (r);
+    r->next = 0; // zero means no next relation in this grid cell (we start real relations at index 1).
+    if (grid_cell != NULL) {
+        r->next = grid_cell->head_relation;
+        grid_cell->head_relation = relation->id;
+    }
+    rels_loaded++;
+    if (rels_loaded % 1000 == 0)
+        fprintf(stderr, "loaded %ldk relations\n", rels_loaded / 1000);
+}
+
+/*
   Used for setting the grid side empirically.
-  With 8 bit (255x255) grid, planet.pbf gives 36.87% full
+  With 8 bit (256x256) grid, planet.pbf gives 36.87% full
   With 14 bit grid: 248351486 empty 20083970 used, 7.48% full
 */
 static void fillFactor () {
     int used = 0;
     for (int i = 0; i < GRID_DIM; ++i) {
         for (int j = 0; j < GRID_DIM; ++j) {
-            if (grid->cells[i][j] != 0) used++;
+            if (grid->cells[i][j].head_way_block != 0) used++;
         }
     }
-    printf("index grid: %d used, %.2f%% full\n",
+    fprintf(stderr, "index grid: %d used, %.2f%% full\n",
         used, ((double)used) / (GRID_DIM * GRID_DIM) * 100);
 }
 
 /* Print out a message explaining command line parameters to the user, then exit. */
 static void usage () {
-    printf("usage:\nvex database_dir input.osm.pbf\n");
-    printf("vex database_dir min_lat min_lon max_lat max_lon\n");
+    fprintf(stderr, "usage:\nvex database_dir input.osm.pbf\n");
+    fprintf(stderr, "vex database_dir min_lat min_lon max_lat max_lon (output_file.pbf|-)\n");
     exit(EXIT_SUCCESS);
 }
 
 /* Range checking. */
 static void check_lat_range(double lat) {
-    if (lat < -90 && lat > 90)
+    if (lat < -90 || lat > 90)
         die ("Latitude out of range.");
 }
 
 /* Range checking. */
 static void check_lon_range(double lon) {
-    if (lon < -180 && lon > 180)
+    if (lon < -180 || lon > 180)
         die ("Longitude out of range.");
 }
 
-/* Functions beginning with print_ output OSM in a simple structured text format. */
-static void print_tags (uint32_t idx) {
-    if (idx == UINT32_MAX) return; // special index indicating no tags
-    char *t = NULL; // &(tags[idx]); // FIXME segment
+/* 
+  Functions beginning with print_ output OSM in a simple structured text format.
+  They are not static because they never need to be fast and they are only called when debugging.
+  External visibility will keep the compiler from complaining when they are unused (hack).
+*/
+void print_tags (uint8_t *tag_data) {
+    char *t = (char*)tag_data;
     KeyVal kv;
     while (*t != INT8_MAX) {
         t += decode_tag(t, &kv);
-        printf("%s=%s ", kv.key, kv.val);
+        fprintf(stderr, "%s=%s ", kv.key, kv.val);
     }
 }
 
-static void print_node (uint64_t node_id) {
+void print_node (uint64_t node_id) {
     Node node = nodes[node_id];
-    printf("  node %ld (%.6f, %.6f) ", node_id, get_lat(&node.coord), get_lon(&node.coord));
-    print_tags(nodes[node_id].tags);
-    printf("\n");
+    fprintf (stderr, "  node %ld (%.6f, %.6f) ", node_id, get_lat(&node.coord), get_lon(&node.coord));
+    uint8_t *tag_data = tag_data_for_id (node_id, NODE);
+    fprintf (stderr, "(offset %d)", node.tags);
+    print_tags (tag_data + node.tags);
+    fprintf (stderr, "\n");
 }
 
-static void print_way (int64_t way_id) {
-    printf("way %ld ", way_id);
-    print_tags(ways[way_id].tags);
-    printf("\n");
+void print_way (int64_t way_id) {
+    fprintf (stderr, "way %ld ", way_id);
+    uint8_t *tag_data = tag_data_for_id (way_id, WAY);
+    print_tags (tag_data + ways[way_id].tags);
+    fprintf (stderr, "\n");
 }
 
-/*
-  Fields and functions for saving compact binary OSM.
-  This is comparable in size to PBF if you zlib it in blocks, but much simpler.
+/* 
+    Functions prefixed with vexbin_write_ output OSM in a much simpler binary format.
+    This is comparable in size or smaller than PBF if you zlib it in blocks, but much simpler.
+    Q: why does PBF use string tables since a similar result is achieved by zipping the blocks?
+    The variables declared here are used to hold shared state for all the write functions.
+    TODO move to another module, or namespace these variables with a prefix or a struct.
 */
-FILE *ofile;
+
 int32_t last_x, last_y;
 int64_t last_node_id, last_way_id;
+FILE *ofile;
 
-static void save_init () {
-    ofile = NULL; //open_db_file("out.bin", 0);
+/* Begin writing to a VEx format OSM file. */
+void vexbin_write_init (FILE *output_file) {
     last_x = 0;
     last_y = 0;
     last_node_id = 0;
     last_way_id = 0;
+    ofile = output_file;
 }
 
-static void save_tags (uint32_t idx) {
-    KeyVal kv;
-    if (idx != UINT32_MAX) {
-        char *t0 = NULL; //&(tags[idx]); // FIXME segment
-        char *t = t0;
-        while (*t != INT8_MAX) t += decode_tag(t, &kv);
-        fwrite(t0, t - t0, 1, ofile);
+/* Write a positive integer to the output file using Protobuf variable width conventions. */
+static void vexbin_write_length (size_t length) {
+    // max length of a 64 bit varint is 10 bytes
+    uint8_t varint_buf[10]; 
+    size_t size = uint64_pack (length, varint_buf);
+    fwrite (&varint_buf, size, 1, ofile);
+}
+
+/* Write a signed integer to the output file using Protobuf variable width conventions. */
+static void vexbin_write_signed (int64_t length) {
+    // max length of a 64 bit varint is 10 bytes
+    uint8_t varint_buf[10]; 
+    size_t size = sint64_pack (length, varint_buf);
+    fwrite (&varint_buf, size, 1, ofile);
+}
+
+/* 
+  Write a byte buffer to the output file, where the buffer address and length are provided separately.
+  The raw bytes are prefixed with a variable-width integer giving their length. This format should 
+  be the same size as the zero-terminated representation for for all strings up to 128 characters.
+*/
+static void vexbin_write_buf (char *bytes, size_t length) {
+    vexbin_write_length (length);
+    fwrite (bytes, length, 1, ofile);
+}
+
+/* Write a zero-terminated string using our byte buffer format. */
+static void vexbin_write_string (char *string) {
+    size_t len = strlen (string);
+    vexbin_write_buf (string, len);
+}
+
+/* 
+  Decode a list of tags from VEx internal format and write them out as length-prefixed strings.
+  The length of this list is output first as a variable-width integer.
+  The subsequent data compression pass should tokenize any frequently occurring tags.
+*/
+static void vexbin_write_tags (uint8_t *tag_data) {
+    KeyVal kv; // stores the output of the tag decoder function
+    char *t0 = (char*) tag_data;
+    char *t = t0;
+    int ntags = 0;
+    /* First count the number of tags and write out that number. */
+    while (*t != INT8_MAX) {
+        t += decode_tag (t, &kv);
+        ntags += 1;
     }
-    fputc(INT8_MAX, ofile);
+    vexbin_write_length (ntags);
+    /* Then reset to the beginning of the list and actually write out the tags. */
+    t = t0;
+    while (*t != INT8_MAX) {
+        t += decode_tag (t, &kv);        
+        vexbin_write_string (kv.key);
+        vexbin_write_string (kv.val);
+    }
 }
 
-static void save_node (int64_t node_id) {
+static void vexbin_write_node (int64_t node_id) {
     Node node = nodes[node_id];
-    uint8_t buf[10]; // 10 is max length of a 64 bit varint
     int64_t id_delta = node_id - last_node_id;
+    // TODO convert to fixed-point lat,lon as in PBF?
     int32_t x_delta = node.coord.x - last_x;
     int32_t y_delta = node.coord.y - last_y;
-    size_t size;
-    size = sint64_pack(id_delta, buf);
-    fwrite(&buf, size, 1, ofile);
-    size = sint32_pack(x_delta, buf);
-    fwrite(&buf, size, 1, ofile);
-    size = sint32_pack(y_delta, buf);
-    fwrite(&buf, size, 1, ofile);
-    save_tags(node.tags);
+    vexbin_write_signed (id_delta);
+    vexbin_write_signed (x_delta);
+    vexbin_write_signed (y_delta);
+    uint8_t *tag_data = tag_data_for_id (node_id, NODE);
+    vexbin_write_tags (tag_data + node.tags); // TODO does this work if tag list is empty?
+    /* Retain values to allow delta-coding on next node to be written. */
     last_node_id = node_id;
     last_x = node.coord.x;
     last_y = node.coord.y;
 }
 
-static void save_way (int64_t way_id) {
+static void vexbin_write_way (int64_t way_id) {
     Way way = ways[way_id];
-    uint8_t buf[10]; // 10 is max length of a 64 bit varint
     int64_t id_delta = way_id - last_way_id;
-    size_t size = sint64_pack(id_delta, buf);
-    fwrite(&buf, size, 1, ofile);
-    save_tags(way.tags);
+    vexbin_write_signed (id_delta);
+    /* Count the number of node refs in this way and write out the count before the list. */
+    int n_refs = 0;
+    for (int64_t *node_ref_p = node_refs + way.node_ref_offset; true; node_ref_p++) {
+        n_refs++;
+        if (*node_ref_p < 0) break;
+    }
+    vexbin_write_length (n_refs);
+    int64_t *node_refs_for_way = node_refs + way.node_ref_offset;
+    for (int r = 0; r < n_refs; r++) {
+        int64_t node_ref = node_refs_for_way[r];
+        if (node_ref < 0) node_ref = -node_ref;
+        // Delta code way references (even across ways) 
+        int64_t ref_delta = node_ref - last_node_id;
+        last_node_id = node_ref; 
+        vexbin_write_signed (ref_delta);
+    }
+    uint8_t *tag_data = tag_data_for_id (way_id, WAY);
+    vexbin_write_tags (tag_data + way.tags);
+    /* Retain value to allow delta-coding on next way to be written. */
     last_way_id = way_id;
 }
 
@@ -575,26 +741,31 @@ int main (int argc, const char * argv[]) {
     if (lock_fd == -1) die ("Error opening or creating lock file.");
 
     /* Memory-map files for each OSM element type, and for references between them. */
-    grid       = map_file("grid",       0, sizeof(Grid));
-    ways       = map_file("ways",       0, sizeof(Way)      * MAX_WAY_ID);
-    nodes      = map_file("nodes",      0, sizeof(Node)     * MAX_NODE_ID);
-    node_refs  = map_file("node_refs",  0, sizeof(int64_t)  * MAX_NODE_REFS);
-    way_blocks = map_file("way_blocks", 0, sizeof(WayBlock) * MAX_WAY_BLOCKS);
+    grid        = map_file("grid",        0, sizeof(Grid));
+    ways        = map_file("ways",        0, sizeof(Way)       * MAX_WAY_ID);
+    nodes       = map_file("nodes",       0, sizeof(Node)      * MAX_NODE_ID);
+    node_refs   = map_file("node_refs",   0, sizeof(int64_t)   * MAX_NODE_REFS);
+    way_blocks  = map_file("way_blocks",  0, sizeof(WayBlock)  * MAX_WAY_BLOCKS);
+    relations   = map_file("relations",   0, sizeof(Relation)  * MAX_REL_ID);
+    rel_members = map_file("rel_members", 0, sizeof(RelMember) * MAX_REL_MEMBERS);
 
     if (argc == 3) {
         /* LOAD */
         const char *filename = argv[2];
-        osm_callbacks_t callbacks;
-        callbacks.way = &handle_way;
-        callbacks.node = &handle_node;
+        PbfReadCallbacks callbacks = {
+            .way  = &handle_way,
+            .node = &handle_node,
+            .relation = &handle_relation
+        };
         /* Request an exclusive write lock, blocking while reads complete. */
-        printf("Acquiring exclusive write lock on database.\n");
-        flock(lock_fd, LOCK_EX); 
-        scan_pbf(filename, &callbacks); // we could just pass the callbacks by value
+        fprintf(stderr, "Acquiring exclusive write lock on database.\n");
+        flock(lock_fd, LOCK_EX);
+        pbf_read (filename, &callbacks); // we could just pass the callbacks by value
         fillFactor();
         /* Release exclusive write lock, allowing reads to begin. */
         flock(lock_fd, LOCK_UN);
-        printf("loaded %ld nodes and %ld ways total.\n", nodes_loaded, ways_loaded);
+        fprintf(stderr, "loaded %ld nodes, %ld ways, and %ld relations total.\n", 
+                nodes_loaded, ways_loaded, rels_loaded);
         return EXIT_SUCCESS;
     } else if (argc == 7) {
         /* QUERY */
@@ -602,7 +773,7 @@ int main (int argc, const char * argv[]) {
         double min_lon = strtod(argv[3], NULL);
         double max_lat = strtod(argv[4], NULL);
         double max_lon = strtod(argv[5], NULL);
-        printf("min = (%.5lf, %.5lf) max = (%.5lf, %.5lf)\n", min_lat, min_lon, max_lat, max_lon);
+        fprintf(stderr, "min = (%.5lf, %.5lf) max = (%.5lf, %.5lf)\n", min_lat, min_lon, max_lat, max_lon);
         check_lat_range(min_lat);
         check_lat_range(max_lat);
         check_lon_range(min_lon);
@@ -616,18 +787,56 @@ int main (int argc, const char * argv[]) {
         uint32_t max_xbin = bin(cmax.x);
         uint32_t min_ybin = bin(cmin.y);
         uint32_t max_ybin = bin(cmax.y);
+        bool vexformat = false;
 
         /* Request a shared read lock, blocking while any writes to complete. */
-        printf("Acquiring shared read lock on database.\n");
-        flock(lock_fd, LOCK_SH); 
-        FILE *pbf_file = open_output_file(argv[6], 0);
-        write_pbf_begin(pbf_file);
+        fprintf(stderr, "Acquiring shared read lock on database.\n");
+        flock(lock_fd, LOCK_SH);
 
-        /* Make two passes, first outputting all nodes, then all ways. */
-        for (int stage = NODE; stage < RELATION; stage++) {
+        /* Get the output stream, interpreting the dash character as stdout. */
+        FILE *pbf_file;
+        if (strcmp(argv[6], "-") == 0) {
+            pbf_file = stdout;
+        } else {
+            pbf_file = open_output_file (argv[6], 0);
+            char *dot = strrchr (argv[6],'.');
+            /* Use a custom binary format when the file extension is .vex */
+            if (dot != NULL && strcmp (dot,".vex") == 0) {
+                vexformat = true;
+                fprintf (stderr, "Output will be in VEx binary format.\n");
+            }
+        }
+
+        /* Initialize writing state for the chosen format. */
+        if (vexformat) {
+            vexbin_write_init (pbf_file);
+        } else {
+            pbf_write_begin(pbf_file);
+        }
+
+        /* Initialize the ID tracker so we can avoid outputting nodes more than once. */
+        IDTracker_reset ();
+        
+        /* Make three passes, first outputting all nodes, then all ways, then all relations. */
+        for (int stage = NODE; stage <= RELATION; stage++) {
             for (uint32_t x = min_xbin; x <= max_xbin; x++) {
                 for (uint32_t y = min_ybin; y <= max_ybin; y++) {
-                    uint32_t wbidx = grid->cells[x][y];
+                    if (stage == RELATION) {
+                        uint32_t rel_id = grid->cells[x][y].head_relation;
+                        while (rel_id > 0) {
+                            Relation rel = relations[rel_id];
+                            if (vexformat) {
+                                // TODO NOOP
+                            } else {
+                                uint8_t *tags = tag_data_for_id (rel_id, RELATION);
+                                pbf_write_relation (rel_id, &(rel_members[rel.member_offset]), &(tags[rel.tags]));
+                            }
+                            rel_id = rel.next; // list links within a cell are embedded in relations
+                        }
+                        continue; // all the rest of the code in the y loop body is for WAY and NODE
+                    }
+                    /* Following code handles NODE and WAY if RELATION clause was not entered. */
+                    uint32_t wbidx = grid->cells[x][y].head_way_block;
                     // printf ("xbin=%d ybin=%d way bin index %u\n", x, y, wbidx);
                     if (wbidx == 0) continue; // There are no ways in this grid cell.
                     /* Iterate over all ways in this block, and its chained blocks. */
@@ -638,11 +847,15 @@ int main (int argc, const char * argv[]) {
                             if (way_id <= 0) break;
                             Way way = ways[way_id];
                             if (stage == WAY) {
-                                uint8_t *tags = tag_data_for_id(way_id, WAY);
-                                write_pbf_way(way_id, &(node_refs[way.node_ref_offset]), &(tags[way.tags]));
+                                // print_way (way_id); // DEBUG
+                                if (vexformat) {
+                                    vexbin_write_way (way_id);
+                                } else {
+                                    uint8_t *tags = tag_data_for_id(way_id, WAY);
+                                    pbf_write_way(way_id, &(node_refs[way.node_ref_offset]), &(tags[way.tags]));
+                                }
                             } else if (stage == NODE) {
                                 /* Output all nodes in this way. */
-                                //FIXME Intersection nodes are repeated.
                                 uint32_t nr = way.node_ref_offset;
                                 bool more = true;
                                 for (; more; nr++) {
@@ -651,10 +864,17 @@ int main (int argc, const char * argv[]) {
                                         node_id = -node_id;
                                         more = false;
                                     }
-                                    Node node = nodes[node_id];
-                                    uint8_t *tags = tag_data_for_id(node_id, NODE);
-                                    write_pbf_node(node_id, get_lat(&(node.coord)),
-                                        get_lon(&(node.coord)), &(tags[node.tags]));
+                                    // print_node (node_id); // DEBUG
+                                    /* Mark this node, and skip outputting it if already seen. */
+                                    if (IDTracker_set (node_id)) continue;
+                                    if (vexformat) {
+                                        vexbin_write_node (node_id);
+                                    } else {
+                                        Node node = nodes[node_id];
+                                        uint8_t *tags = tag_data_for_id(node_id, NODE);
+                                        pbf_write_node(node_id, get_lat(&(node.coord)),
+                                            get_lon(&(node.coord)), &(tags[node.tags]));
+                                    }
                                 }
                             }
                         }
@@ -664,7 +884,7 @@ int main (int argc, const char * argv[]) {
                 }
             }
             /* Write out any buffered nodes or ways before beginning the next PBF writing stage. */
-            write_pbf_flush();
+            if (!vexformat) pbf_write_flush();
         }
         fclose(pbf_file);
         flock(lock_fd, LOCK_UN); // release the shared lock, allowing writes to begin.

@@ -75,7 +75,7 @@ static KVTable tables[] = {
             "reservoir",
             "industrial"
         }
-    }, 
+    },
     {
         "surface", 12, (char *[]) {
             "asphalt",
@@ -115,7 +115,7 @@ static KVTable tables[] = {
             "substation",
             "station"
         }
-    }, 
+    },
     {
         "traffic_calming", 5, (char *[]) {
             "bump",
@@ -124,7 +124,7 @@ static KVTable tables[] = {
             "yes",
             "island"
         }
-    }, 
+    },
     {
         "railway", 8, (char *[]) {
             "rail",
@@ -136,7 +136,7 @@ static KVTable tables[] = {
             "switch",
             "platform"
         }
-    }, 
+    },
     {
         "service", 8, (char *[]) {
             "parking_aisle",
@@ -148,7 +148,7 @@ static KVTable tables[] = {
             "drive-through",
             "emergency_access"
         }
-    }, 
+    },
     {
         "access", 8, (char *[]) {
             "private",
@@ -160,7 +160,7 @@ static KVTable tables[] = {
             "customers",
             "designated"
         }
-    }, 
+    },
     {
         "crossing", 6, (char *[]) {
             "uncontrolled",
@@ -170,7 +170,7 @@ static KVTable tables[] = {
             "zebra",
             "no"
         }
-    }, 
+    },
     {
         "footway", 8, (char *[]) {
             "sidewalk",
@@ -182,7 +182,7 @@ static KVTable tables[] = {
             "no",
             "yes"
         }
-    }, 
+    },
     {NULL, 0, NULL} // sentinel
 };
 
@@ -272,7 +272,7 @@ size_t decode_tag (char *buf, KeyVal *kv) {
     } else {
         code -= 1; // table codes are one-based, shift toward zero
         KVTable *table = &tables[0];
-        while (code >= table->len) { 
+        while (code >= table->len) {
             code -= table->len;
             table++;
             if (table->key == NULL) return -1; // table overrun, invalid input code
@@ -282,10 +282,50 @@ size_t decode_tag (char *buf, KeyVal *kv) {
         kv->val = table->vals[code];
     }
     size_t n_decoded = c - buf;
-    // printf ("\ndecoded %zd bytes: ", n_decoded);
+    // fprintf (stderr, "\ndecoded %zd bytes: ", n_decoded);
     // fwrite (buf, n_decoded, 1, stdout);
     // fputc ('\n', stdout);
     return n_decoded;
 }
 
+/* We also include relation role encoding here because the logic is so similar. */
+
+/* These are the most common roles in the Northeast United States according to our tagstats script. */
+char *relation_roles[] = {
+    "[OTHER]", // zero is used for all unrecognized roles
+    "forward",
+    "outer",
+    "inner",
+    "from",
+    "to",
+    "via",
+    "south",
+    "platform",
+    "west",
+    "east",
+    "north",
+    "stop",
+    "backward",
+    "label",
+    "link",
+    "subarea",
+    "device",
+    "intersection",
+    "sign",
+    NULL // list terminator, max allowed array length is 256
+};
+
+uint8_t encode_role (ProtobufCBinaryData role) {
+    /* Start at 1 because zero signifies "other role". */
+    for (uint8_t code = 1; relation_roles[code] != NULL; code++) {
+        if (memcmp(relation_roles[code], role.data, role.len) == 0) {
+            return code; // Found role string, return its index
+        }
+    }
+    return 0; // No code found for this role
+}
+
+char *decode_role (uint8_t code) {
+    return relation_roles[code];
+}
 

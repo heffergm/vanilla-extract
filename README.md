@@ -23,7 +23,7 @@ Then just make as usual:
 
 ## usage
 
-Only store the database on a filesystem that supports sparse files (ext3 and ext4 do). Everything goes much quicker on a solid-state disk. 
+Only store the database on a filesystem that supports sparse files (ext3 and ext4 do). Everything goes much quicker on a solid-state disk.
 The program itself should only need a few megabytes of memory but benefits greatly from free memory that the OS can use as cache.
 
 To load a PBF file into the database:
@@ -34,22 +34,32 @@ Loading a full planet PBF to a solid-state drive will take at least an hour, so 
 
 Once your PBF data is loaded, to perform an extract run:
 
-`./vex <database_directory> <min_lat> <min_lon> <max_lat> <max_lon>`
+`./vex <database_directory> <min_lat> <min_lon> <max_lat> <max_lon> <output_file.pbf>`
 
-The extract will be saved to the database directory under the name `out.pbf`. (This will of course be changed to stdout or a user-specified filename soon.)
+If you specify `-` as the output file, `vex` will write to standard output.
+
+### usage over http
+
+`vexserver.js` provides a simple NodeJS server to run `vex` over HTTP. This is useful if you want to keep all your data
+in one place, or if you only have one server with a large SSD. It requires data to already be loaded to the database,
+and is used like so:
+
+`node vexserver.js` (on ubuntu, `nodejs vexserver.js`)
+
+Parameters are taken from the environment:
+- VEX_DB: the path to the vex database to use, default '/var/osm/db/'
+- VEX_CMD: the command to run vex, default 'vex'. If vex is not in your path, change to a relative or absolute path to the binary.
+- VEX_HOST: the hostname to bind on, or 0.0.0.0 for all interfaces; default 0.0.0.0
+- VEX_PORT: the port to server on, default 8282
 
 ## road ahead
 
 Remaining loose ends to provide lossless extracts:
 
-* Avoid repeated instances of intersection nodes. Solvable with a sparse bitset (already implemented).
 * Retain isolated nodes that are not referenced by a way. Such nodes must be indexed alongside the ways in each grid bin.
-* Reading, storage, and writing of relations.
-* Dense nodes.
- 
-Future possbilities include:
+* Dense nodes (though this is a quirk of the PBF format and may be avoided by using our native format).
+
+Future possibilities include:
 
 * Keep db in sync with minutely updates
-* Allow testing to see if a given bounding box has been invalidated by updates since X date 
-* Build HTTP end-point to stream PBF directly, skipping disk for outputs
-
+* Allow testing to see if a given bounding box has been invalidated by updates since X date
